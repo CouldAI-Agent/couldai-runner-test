@@ -1,0 +1,145 @@
+name: Flutter iOS Build and Publish
+run-name: "CouldAI Build #${{ inputs.build_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      project_id:
+        required: true
+        type: string
+      version_id:
+        required: true
+        type: string
+      archive_url:
+        required: true
+        type: string
+      archive_sha256:
+        required: true
+        type: string
+      environment_name:
+        required: true
+        type: string
+jobs:
+  flutter_ios_build_publish:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    environment:
+      name: ${{ inputs.environment_name }}
+    steps:
+      - name: Download project source from R2
+        env:
+          ARCHIVE_URL: ${{ inputs.archive_url }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          command -v zstd >/dev/null || brew install zstd
+          curl --fail --location --retry 3 "$ARCHIVE_URL" --output project.tar.zst
+          echo "$ARCHIVE_SHA256  project.tar.zst" | shasum -a 256 --check
+          mkdir -p usr
+          tar --use-compress-program=unzstd -xf project.tar.zst -C usr
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2.0'
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+      - name: Install Fastlane
+        run: gem install fastlane
+      - name: Get dependencies
+        working-directory: ./usr
+        run: flutter pub get
+      - name: Prepare iOS certificate
+        working-directory: ./usr/ios
+        run: echo "${{ secrets.IOS_P12_CERTIFICATE_BASE64 }}" | base64 --decode > certificate.p12
+      - name: Create iOS Fastfile
+        run: |
+          mkdir -p ./usr/ios/fastlane
+          cat > ./usr/ios/fastlane/Fastfile <<'FASTFILE'
+          require 'json'
+          opt_out_usage
+          default_platform(:ios)
+
+          platform :ios do
+            lane :build_and_publish do
+              setup_ci(force: true, timeout: 0)
+              create_keychain(name: "ios-build.keychain", password: "", default_keychain: true, unlock: true, timeout: 3600, lock_when_sleeps: false)
+              api_key_data = JSON.parse(ENV['APP_STORE_CREDENTIALS_JSON'])
+              api_key = app_store_connect_api_key(
+                key_id: api_key_data["key_id"],
+                issuer_id: api_key_data["issuer_id"],
+                key_content: api_key_data["api_key"],
+                in_house: false,
+                is_key_content_base64: false
+              )
+              import_certificate(certificate_path: "certificate.p12", certificate_password: ENV['IOS_CERTIFICATE_PASSWORD'], keychain_name: "ios-build.keychain", keychain_password: "")
+              sigh(app_identifier: ENV['PACKAGE_NAME'], api_key: api_key, team_id: ENV['IOS_TEAM_ID'], force: true)
+              update_code_signing_settings(
+                use_automatic_signing: false,
+                path: "Runner.xcodeproj",
+                code_sign_identity: "Apple Distribution",
+                bundle_identifier: ENV['PACKAGE_NAME'],
+                profile_name: lane_context[SharedValues::SIGH_NAME],
+                profile_uuid: lane_context[SharedValues::SIGH_UUID],
+                team_id: ENV['IOS_TEAM_ID']
+              )
+              gym(
+                workspace: "Runner.xcworkspace",
+                scheme: "Runner",
+                output_directory: "./build/ios/ipa",
+                output_name: "app.ipa",
+                export_method: "app-store",
+                xcargs: "-allowProvisioningUpdates",
+                include_symbols: true,
+                include_bitcode: false,
+                export_options: {
+                  method: "app-store",
+                  team_id: ENV['IOS_TEAM_ID'],
+                  manageAppVersionAndBuildNumber: true,
+                  provisioningProfiles: { ENV['PACKAGE_NAME'] => lane_context[SharedValues::SIGH_NAME] }
+                },
+                clean: true
+              )
+              upload_to_app_store(
+                api_key: api_key,
+                app_identifier: ENV['PACKAGE_NAME'],
+                team_id: ENV['IOS_TEAM_ID'],
+                ipa: "./build/ios/ipa/app.ipa",
+                skip_screenshots: true,
+                skip_metadata: true,
+                precheck_include_in_app_purchases: false,
+                submit_for_review: false
+              )
+            end
+          end
+          FASTFILE
+      - name: Configure temporary iOS signing settings
+        working-directory: ./usr/ios
+        run: |
+          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = .*;/PRODUCT_BUNDLE_IDENTIFIER = ${{ secrets.PACKAGE_NAME }};/g" Runner.xcodeproj/project.pbxproj
+          sed -i '' "s/DEVELOPMENT_TEAM = .*;/DEVELOPMENT_TEAM = ${{ secrets.IOS_TEAM_ID }};/g" Runner.xcodeproj/project.pbxproj
+          grep -q "DEVELOPMENT_TEAM" Runner.xcodeproj/project.pbxproj || sed -i '' "/PRODUCT_BUNDLE_IDENTIFIER/a\\
+          DEVELOPMENT_TEAM = ${{ secrets.IOS_TEAM_ID }};" Runner.xcodeproj/project.pbxproj
+      - name: Build and publish iOS app
+        working-directory: ./usr/ios
+        env:
+          PACKAGE_NAME: ${{ secrets.PACKAGE_NAME }}
+          APP_STORE_CREDENTIALS_JSON: ${{ secrets.APP_STORE_CREDENTIALS_JSON }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: fastlane build_and_publish
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-release-build
+          path: ./usr/ios/build/ios/ipa/*.ipa
+          retention-days: 7
