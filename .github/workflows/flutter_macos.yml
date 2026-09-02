@@ -1,0 +1,61 @@
+name: Flutter macOS Build
+run-name: "CouldAI Build #${{ inputs.build_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      project_id:
+        required: true
+        type: string
+      version_id:
+        required: true
+        type: string
+      archive_url:
+        required: true
+        type: string
+      archive_sha256:
+        required: true
+        type: string
+      environment_name:
+        required: true
+        type: string
+jobs:
+  flutter_macos_build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Download project source from R2
+        env:
+          ARCHIVE_URL: ${{ inputs.archive_url }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          command -v zstd >/dev/null || brew install zstd
+          curl --fail --location --retry 3 "$ARCHIVE_URL" --output project.tar.zst
+          echo "$ARCHIVE_SHA256  project.tar.zst" | shasum -a 256 --check
+          mkdir -p usr
+          tar --use-compress-program=unzstd -xf project.tar.zst -C usr
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+      - name: Get dependencies
+        working-directory: ./usr
+        run: flutter pub get
+      - name: Enable macOS
+        working-directory: ./usr
+        run: flutter config --enable-macos-desktop
+      - name: Build macOS application
+        working-directory: ./usr
+        run: flutter build macos --release
+      - name: Create ZIP archive
+        working-directory: ./usr/build/macos/Build/Products/Release
+        run: zip -r macos-app.zip *.app
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-release-build
+          path: ./usr/build/macos/Build/Products/Release/macos-app.zip
+          retention-days: 7
