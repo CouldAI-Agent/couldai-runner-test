@@ -1,0 +1,65 @@
+name: Flutter Windows Build
+run-name: "CouldAI Build #${{ inputs.build_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      project_id:
+        required: true
+        type: string
+      version_id:
+        required: true
+        type: string
+      archive_url:
+        required: true
+        type: string
+      archive_sha256:
+        required: true
+        type: string
+      environment_name:
+        required: true
+        type: string
+jobs:
+  flutter_windows_build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Download project source from R2
+        shell: pwsh
+        env:
+          ARCHIVE_URL: ${{ inputs.archive_url }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          Invoke-WebRequest -Uri $env:ARCHIVE_URL -OutFile project.tar.zst
+          $actualHash = (Get-FileHash project.tar.zst -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:ARCHIVE_SHA256.ToLowerInvariant()) {
+            throw "Project archive checksum mismatch"
+          }
+          New-Item -ItemType Directory -Force -Path archive, usr | Out-Null
+          7z x project.tar.zst -oarchive -y
+          7z x archive/project.tar -ousr -y
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+      - name: Get dependencies
+        working-directory: ./usr
+        run: flutter pub get
+      - name: Enable Windows
+        working-directory: ./usr
+        run: flutter config --enable-windows-desktop
+      - name: Build Windows application
+        working-directory: ./usr
+        run: flutter build windows --release
+      - name: Create ZIP archive
+        shell: pwsh
+        run: Compress-Archive -Path ./usr/build/windows/x64/runner/Release/* -DestinationPath windows-app.zip
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-release-build
+          path: windows-app.zip
+          retention-days: 7
