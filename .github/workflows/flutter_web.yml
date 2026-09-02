@@ -1,0 +1,132 @@
+name: Flutter Web Build
+run-name: "CouldAI Build #${{ inputs.build_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      project_id:
+        required: true
+        type: string
+      version_id:
+        required: true
+        type: string
+      archive_url:
+        required: true
+        type: string
+      archive_sha256:
+        required: true
+        type: string
+      environment_name:
+        required: true
+        type: string
+      r2_bucket:
+        required: true
+        type: string
+      r2_endpoint:
+        required: true
+        type: string
+concurrency:
+  group: couldai-web-${{ inputs.project_id }}
+  cancel-in-progress: false
+jobs:
+  flutter_web_build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Install archive dependency
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Download project source from R2
+        env:
+          ARCHIVE_URL: ${{ inputs.archive_url }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          curl --fail --location --retry 3 "$ARCHIVE_URL" --output project.tar.zst
+          echo "$ARCHIVE_SHA256  project.tar.zst" | sha256sum --check -
+          mkdir -p usr
+          tar --use-compress-program=unzstd -xf project.tar.zst -C usr
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+      - name: Get dependencies
+        working-directory: ./usr
+        run: flutter pub get
+      - name: Enable web
+        working-directory: ./usr
+        run: flutter config --enable-web
+      - name: Build web application
+        working-directory: ./usr
+        run: flutter build web --release --base-href /
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: web-release-build
+          path: ./usr/build/web
+          retention-days: 7
+  deploy_web_to_r2:
+    needs: flutter_web_build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: ${{ inputs.environment_name }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_TEMP_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_TEMP_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.R2_TEMP_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: auto
+      AWS_EC2_METADATA_DISABLED: "true"
+      R2_BUCKET: ${{ inputs.r2_bucket }}
+      R2_ENDPOINT: ${{ inputs.r2_endpoint }}
+      PROJECT_ID: ${{ inputs.project_id }}
+      BUILD_ID: ${{ inputs.build_id }}
+      VERSION_ID: ${{ inputs.version_id }}
+    steps:
+      - name: Download web build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: web-release-build
+          path: ./web-release-build
+      - name: Upload immutable web build to R2
+        run: |
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$AWS_SESSION_TOKEN"
+          aws s3 sync ./web-release-build "s3://$R2_BUCKET/$PROJECT_ID/$BUILD_ID/" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --no-follow-symlinks \
+            --only-show-errors
+      - name: Activate uploaded web build
+        run: |
+          jq -n \
+            --arg build_id "$BUILD_ID" \
+            --arg project_version "$VERSION_ID" \
+            --arg published_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{build_id: ($build_id | tonumber), project_version: $project_version, published_at: $published_at}' \
+            > published.json
+          aws s3 cp published.json "s3://$R2_BUCKET/$PROJECT_ID/published.json" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type "application/json" \
+            --cache-control "no-store" \
+            --only-show-errors
+      - name: Remove superseded web builds
+        continue-on-error: true
+        run: |
+          current_prefix="$PROJECT_ID/$BUILD_ID/"
+          prefixes=$(aws s3api list-objects-v2 \
+            --bucket "$R2_BUCKET" \
+            --prefix "$PROJECT_ID/" \
+            --delimiter "/" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --query 'CommonPrefixes[].Prefix' \
+            --output text)
+          for prefix in $prefixes; do
+            if [[ "$prefix" != "$current_prefix" ]]; then
+              aws s3 rm "s3://$R2_BUCKET/$prefix" \
+                --recursive \
+                --endpoint-url "$R2_ENDPOINT" \
+                --only-show-errors
+            fi
+          done
