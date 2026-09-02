@@ -1,0 +1,76 @@
+name: Flutter Android APK Build
+run-name: "CouldAI Build #${{ inputs.build_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      project_id:
+        required: true
+        type: string
+      version_id:
+        required: true
+        type: string
+      archive_url:
+        required: true
+        type: string
+      archive_sha256:
+        required: true
+        type: string
+      environment_name:
+        required: true
+        type: string
+jobs:
+  flutter_android_apk_build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: ${{ inputs.environment_name }}
+    steps:
+      - name: Install archive dependency
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Download project source from R2
+        env:
+          ARCHIVE_URL: ${{ inputs.archive_url }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          curl --fail --location --retry 3 "$ARCHIVE_URL" --output project.tar.zst
+          echo "$ARCHIVE_SHA256  project.tar.zst" | sha256sum --check -
+          mkdir -p usr
+          tar --use-compress-program=unzstd -xf project.tar.zst -C usr
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: '17'
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+      - name: Get dependencies
+        working-directory: ./usr
+        run: flutter pub get
+      - name: Setup Android signing
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > keystore.jks
+          KEYSTORE_PATH="$(pwd)/keystore.jks"
+          echo "storeFile=$KEYSTORE_PATH" > ./usr/android/key.properties
+          echo "storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> ./usr/android/key.properties
+          echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" >> ./usr/android/key.properties
+          echo "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}" >> ./usr/android/key.properties
+          KEYSTORE_INFO="$(keytool -list -v -keystore keystore.jks -alias "${{ secrets.ANDROID_KEY_ALIAS }}" -storepass "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}")"
+          if echo "$KEYSTORE_INFO" | grep -qi "Owner: CN=Android Debug"; then
+            echo "::error::The configured Android keystore is a debug keystore."
+            exit 1
+          fi
+      - name: Build Android APK
+        working-directory: ./usr
+        run: flutter build apk --release
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: android-release-apk
+          path: ./usr/build/app/outputs/flutter-apk/*.apk
+          retention-days: 7
